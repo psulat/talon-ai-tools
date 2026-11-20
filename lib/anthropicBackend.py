@@ -31,6 +31,12 @@ FALLBACK_BETA = "server-side-fallback-2026-07-01"
 FALLBACK_MODEL_PREFIXES = ("claude-opus-5-5", "claude-sonnet-5-5")
 CONNECT_TIMEOUT_S = 5
 
+# One pooled HTTPS connection, reused across requests (2026-11-20): a fresh
+# requests.post() pays a TCP + TLS handshake every time, which matters most for
+# back-to-back follow-ups. If the server has dropped an idle connection, the
+# network-error retry in create_message() covers it.
+_session = requests.Session()
+
 
 class AnthropicError(Exception):
     """A failed Claude call.
@@ -126,7 +132,7 @@ def create_message(
     while True:
         retry_after = None
         try:
-            response = requests.post(
+            response = _session.post(
                 API_URL,
                 headers=headers,
                 data=payload,
