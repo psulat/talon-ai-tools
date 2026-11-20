@@ -59,7 +59,22 @@ mod.setting(
     "model_endpoint",
     type=str,
     default="https://api.openai.com/v1/chat/completions",
-    desc='The endpoint to send the model requests to. If "llm" is specified instead of a url, the llm CLI tool is used when routing all language model requests (see https://github.com/simonw/llm).',
+    desc='The endpoint to send the model requests to. If "llm" is specified instead of a url, the llm CLI tool is used when routing all language model requests (see https://github.com/simonw/llm). If "anthropic", requests go to Claude via the Anthropic Messages API (key from the ANTHROPIC_API_KEY environment variable).',
+)
+
+# Local additions on the claude-backend branch (2026-11-20).
+mod.setting(
+    "model_request_timeout",
+    type=int,
+    default=20,
+    desc="Seconds to wait for a model response before giving up (Claude and OpenAI-style endpoints). Talon is blocked while waiting.",
+)
+
+mod.setting(
+    "model_anthropic_effort",
+    type=str,
+    default="low",
+    desc='Claude effort level: "low", "medium", "high", "xhigh" or "max". Lower is faster and cheaper; "" leaves it to the model default.',
 )
 
 mod.setting(

@@ -11,6 +11,12 @@ import requests
 from talon import actions, app, clip, resource, settings
 
 from ..lib.pureHelpers import strip_markdown
+from .anthropicBackend import (
+    AnthropicError,
+    create_message,
+    extract_text,
+    to_anthropic_content,
+)
 from .modelState import GPTState
 from .modelTypes import GPTMessage, GPTMessageItem
 
@@ -239,6 +245,13 @@ def send_request(
         response = send_request_to_llm_cli(
             prompt, content_to_process, system_message, model, continue_thread
         )
+    elif model_endpoint == "anthropic":
+        # Local claude-backend branch addition (2026-11-20).
+        if continue_thread:
+            notify(
+                "Warning: Thread continuation is not supported with Claude yet (planned: T1.6)"
+            )
+        response = send_request_to_anthropic(request, system_message, model)
     else:
         if continue_thread:
             notify(
@@ -300,7 +313,12 @@ def send_request_to_api(
     else:
         headers["Authorization"] = f"Bearer {token}"
 
-    raw_response = requests.post(url, headers=headers, data=json.dumps(data))
+    # Timeout added on the local claude-backend branch (2026-11-20): upstream
+    # waits forever, which freezes Talon if the endpoint hangs.
+    timeout_s: int = settings.get("user.model_request_timeout")  # type: ignore
+    raw_response = requests.post(
+        url, headers=headers, data=json.dumps(data), timeout=(5, timeout_s)
+    )
 
     match raw_response.status_code:
         case 200:
@@ -312,6 +330,45 @@ def send_request_to_api(
         case _:
             notify("GPT Failure: Check the Talon Log")
             raise Exception(raw_response.json())
+
+
+def send_request_to_anthropic(
+    request: GPTMessage, system_message: str, model: str
+) -> GPTMessageItem:
+    """Send a request to Claude (Anthropic Messages API) and return the response.
+
+    Local addition on the claude-backend branch (2026-11-20); the HTTP client
+    and the reason it isn't the official SDK are in lib/anthropicBackend.py.
+    """
+    config = get_model_config(model)
+    model_id = config["model_id"] if config and "model_id" in config else model
+    messages = [
+        {"role": "user", "content": to_anthropic_content(request["content"])}  # type: ignore
+    ]
+    effort: str = settings.get("user.model_anthropic_effort")  # type: ignore
+    timeout_s: int = settings.get("user.model_request_timeout")  # type: ignore
+
+    if GPTState.debug_enabled:
+        print({"model": model_id, "effort": effort, "system": system_message, "messages": messages})
+
+    try:
+        message = create_message(
+            model=model_id,
+            system=system_message,
+            messages=messages,
+            effort=effort,
+            timeout_s=timeout_s,
+        )
+        text = extract_text(message)
+    except AnthropicError as e:
+        notify(f"Claude failed: {e}")
+        raise
+
+    if message.get("stop_reason") == "max_tokens":
+        notify("Claude's response was cut off (hit max_tokens)")
+    elif settings.get("user.model_verbose_notifications"):
+        notify("GPT Task Completed")
+    return format_message(strip_markdown(text))
 
 
 def send_request_to_llm_cli(
