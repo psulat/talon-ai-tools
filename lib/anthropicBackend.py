@@ -94,6 +94,7 @@ def create_message(
     tools: Optional[list[dict]] = None,
     timeout_s: float = 20,
     retries: int = 1,
+    extra: Optional[dict] = None,
 ) -> dict:
     """POST /v1/messages and return the parsed JSON response.
 
@@ -123,6 +124,10 @@ def create_message(
         body["output_config"] = {"effort": effort}
     if tools:
         body["tools"] = tools
+    if extra:
+        # Other top-level request fields, e.g. cache_control for the
+        # "computer" command's tool loop (personal/ai_actions.py).
+        body.update(extra)
     if model.startswith(FALLBACK_MODEL_PREFIXES):
         headers["anthropic-beta"] = FALLBACK_BETA
         body["fallbacks"] = "default"
