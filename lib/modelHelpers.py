@@ -4,6 +4,8 @@ import logging
 import os
 import platform
 import subprocess
+import time
+from datetime import datetime
 from pathlib import Path
 from typing import IO, Any, Literal, NotRequired, Optional, TypedDict
 
@@ -39,6 +41,24 @@ MODELS_PATH = Path(__file__).parent.parent / "models.json"
 
 # Store loaded model configurations
 model_configs: dict[str, ModelConfig] = {}
+
+# --- Local claude-backend additions (2026-11-20, personal/ai_plan.md) ---
+
+# T1.6: conversation state for "model and ..." follow-ups on the Claude path.
+# Append-only on purpose. Opus/Sonnet 5.5 bind each thinking block to the
+# exact system prompt and every earlier message, and reject a replay whose
+# history was edited (400 "bound to a different conversation"). So the
+# system prompt is frozen at the thread's first turn (talon-ai-tools rebuilds
+# it per request from the active window), old turns are never trimmed, and
+# past the caps a new thread starts instead.
+CLAUDE_THREAD_MAX_TURNS = 10
+CLAUDE_THREAD_TTL_S = 600
+_claude_thread: dict[str, Any] = {"system": "", "messages": [], "updated": 0.0}
+
+# T1.7: local JSONL log of every model request, outside every git repo
+# (%APPDATA%\talon\ai_logs on Windows, ~/.talon/ai_logs on Mac). It holds the
+# text sent and received, so it never leaves this machine.
+LOG_PATH = Path(__file__).resolve().parents[3] / "ai_logs" / "text.jsonl"
 
 
 def load_model_config(f: IO) -> None:
@@ -172,6 +192,8 @@ def send_request(
     model = resolve_model_name(model)
 
     continue_thread = thread == "continueLast"
+    # For the request log (local addition); prompt["text"] is mutated below.
+    original_prompt_text = prompt.get("text", "")
 
     notification = "GPT Task Started"
     if len(GPTState.context) > 0:
@@ -241,25 +263,88 @@ def send_request(
     )
 
     model_endpoint: str = settings.get("user.model_endpoint")  # type: ignore
-    if model_endpoint == "llm":
-        response = send_request_to_llm_cli(
-            prompt, content_to_process, system_message, model, continue_thread
+    started = time.perf_counter()
+    response: Optional[GPTMessageItem] = None
+    error: Optional[Exception] = None
+    try:
+        if model_endpoint == "llm":
+            response = send_request_to_llm_cli(
+                prompt, content_to_process, system_message, model, continue_thread
+            )
+        elif model_endpoint == "anthropic":
+            # Local claude-backend branch addition (2026-11-20).
+            response = send_request_to_anthropic(
+                request, system_message, model, continue_thread
+            )
+        else:
+            if continue_thread:
+                notify(
+                    "Warning: Thread continuation is only supported when using setting user.model_endpoint = 'llm'"
+                )
+            response = send_request_to_api(request, system_message, model)
+        return response
+    except Exception as e:
+        error = e
+        raise
+    finally:
+        log_request(
+            endpoint=model_endpoint,
+            model=model,
+            prompt_text=original_prompt_text,
+            content=content_to_process,
+            response=response,
+            continue_thread=continue_thread,
+            elapsed_ms=(time.perf_counter() - started) * 1000,
+            error=error,
         )
-    elif model_endpoint == "anthropic":
-        # Local claude-backend branch addition (2026-11-20).
-        if continue_thread:
-            notify(
-                "Warning: Thread continuation is not supported with Claude yet (planned: T1.6)"
-            )
-        response = send_request_to_anthropic(request, system_message, model)
-    else:
-        if continue_thread:
-            notify(
-                "Warning: Thread continuation is only supported when using setting user.model_endpoint = 'llm'"
-            )
-        response = send_request_to_api(request, system_message, model)
 
-    return response
+
+def log_request(
+    *,
+    endpoint: str,
+    model: str,
+    prompt_text: str,
+    content: Optional[GPTMessageItem],
+    response: Optional[GPTMessageItem],
+    continue_thread: bool,
+    elapsed_ms: float,
+    error: Optional[Exception],
+) -> None:
+    """Append one request to the local JSONL log (local addition, ai_plan.md T1.7).
+
+    Logging must never break a model command, so every failure here is swallowed.
+    """
+    try:
+        if not settings.get("user.model_log_enabled"):
+            return
+        try:
+            app_name = actions.app.name()
+        except Exception:
+            app_name = ""
+        if content is None:
+            input_text = ""
+        elif content.get("type") == "text":
+            input_text = content.get("text", "")
+        else:
+            input_text = "[image]"
+        record = {
+            "ts": datetime.now().isoformat(timespec="seconds"),
+            "app": app_name,
+            "endpoint": endpoint if endpoint in ("anthropic", "llm") else "openai-style",
+            "model": model,
+            "thread": "continue" if continue_thread else "new",
+            "ms": round(elapsed_ms),
+            "ok": error is None,
+            "error": str(error) if error else "",
+            "prompt": prompt_text,
+            "input": input_text,
+            "output": response.get("text", "") if response else "",
+        }
+        LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+        with open(LOG_PATH, "a", encoding="utf-8") as f:
+            f.write(json.dumps(record, ensure_ascii=False) + "\n")
+    except Exception as e:
+        print(f"talon-ai-tools: could not write request log: {e!r}")
 
 
 def send_request_to_api(
@@ -333,42 +418,96 @@ def send_request_to_api(
 
 
 def send_request_to_anthropic(
-    request: GPTMessage, system_message: str, model: str
+    request: GPTMessage,
+    system_message: str,
+    model: str,
+    continue_thread: bool = False,
 ) -> GPTMessageItem:
     """Send a request to Claude (Anthropic Messages API) and return the response.
 
     Local addition on the claude-backend branch (2026-11-20); the HTTP client
     and the reason it isn't the official SDK are in lib/anthropicBackend.py.
+    With continue_thread, the request is appended to the current thread
+    (see _claude_thread above).
     """
     config = get_model_config(model)
     model_id = config["model_id"] if config and "model_id" in config else model
-    messages = [
-        {"role": "user", "content": to_anthropic_content(request["content"])}  # type: ignore
-    ]
+    new_turn = {"role": "user", "content": to_anthropic_content(request["content"])}  # type: ignore
     effort: str = settings.get("user.model_anthropic_effort")  # type: ignore
     timeout_s: int = settings.get("user.model_request_timeout")  # type: ignore
 
-    if GPTState.debug_enabled:
-        print({"model": model_id, "effort": effort, "system": system_message, "messages": messages})
+    history: list[dict] = _claude_thread["messages"]
+    thread_usable = (
+        bool(history)
+        and time.monotonic() - _claude_thread["updated"] < CLAUDE_THREAD_TTL_S
+        and len(history) // 2 < CLAUDE_THREAD_MAX_TURNS
+    )
+    if continue_thread and thread_usable:
+        system = _claude_thread["system"]
+        messages = history + [new_turn]
+    else:
+        if continue_thread:
+            notify("No recent Claude conversation to continue - starting a new one")
+        system = system_message
+        messages = [new_turn]
 
-    try:
-        message = create_message(
+    if GPTState.debug_enabled:
+        print({"model": model_id, "effort": effort, "system": system, "messages": messages})
+
+    def call(msgs: list[dict]) -> dict:
+        return create_message(
             model=model_id,
-            system=system_message,
-            messages=messages,
+            system=system,
+            messages=msgs,
             effort=effort,
             timeout_s=timeout_s,
         )
+
+    try:
+        try:
+            message = call(messages)
+        except AnthropicError as e:
+            # One-time recovery if the API rejects replayed thinking blocks
+            # (should not happen with an append-only thread): strip them and
+            # retry once, keeping the text of every turn.
+            if not (e.status == 400 and "signature" in str(e) and len(messages) > 1):
+                raise
+            messages = _strip_thinking_blocks(messages)
+            message = call(messages)
         text = extract_text(message)
     except AnthropicError as e:
         notify(f"Claude failed: {e}")
         raise
+
+    # Replies are stored exactly as returned (thinking blocks included).
+    _claude_thread.update(
+        system=system,
+        messages=messages + [{"role": "assistant", "content": message["content"]}],
+        updated=time.monotonic(),
+    )
 
     if message.get("stop_reason") == "max_tokens":
         notify("Claude's response was cut off (hit max_tokens)")
     elif settings.get("user.model_verbose_notifications"):
         notify("GPT Task Completed")
     return format_message(strip_markdown(text))
+
+
+def _strip_thinking_blocks(messages: list[dict]) -> list[dict]:
+    """Drop thinking/redacted_thinking blocks from assistant turns (local addition)."""
+    stripped = []
+    for msg in messages:
+        if msg["role"] == "assistant" and isinstance(msg["content"], list):
+            msg = {
+                **msg,
+                "content": [
+                    block
+                    for block in msg["content"]
+                    if block.get("type") not in ("thinking", "redacted_thinking")
+                ],
+            }
+        stripped.append(msg)
+    return stripped
 
 
 def send_request_to_llm_cli(

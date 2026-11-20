@@ -78,6 +78,13 @@ mod.setting(
 )
 
 mod.setting(
+    "model_log_enabled",
+    type=bool,
+    default=True,
+    desc="If true, append every model request (prompt, input, output, latency) to <talon home>/ai_logs/text.jsonl, outside all git repos.",
+)
+
+mod.setting(
     "model_llm_path",
     type=str,
     default="llm",
