@@ -100,22 +100,38 @@ def _fold(text: str) -> str:
     return _fold_with_map(text)[0]
 
 
-def _selection_matches(expected: str) -> bool:
-    """True if the current selection is `expected`, compared tolerantly (see _FOLD).
+def _uia_selection_text() -> Optional[str]:
+    """The selected text via UI Automation, "" if nothing is selected, or None if the
+    focused control can't report its selection (then the caller copies instead).
 
-    Asks UI Automation first (instant, leaves the clipboard alone) and falls
-    back to copying the selection.
+    Preferred over copying (2026-11-20): reading the selection with Ctrl+C once
+    typed a bare "c" over a selected paragraph in Word - Ctrl apparently didn't
+    register, the same symptom as October's "copy that" typing "c" - and copying
+    costs a clipboard round trip of up to 250 ms. Word reports an empty selection
+    as its paragraph mark, which folds to "".
     """
-    want = _fold(expected).strip()
     pattern = _text_pattern()
-    if pattern is not None:
-        try:
-            ranges = pattern.selection
-            if ranges and _fold(ranges[0].text).strip() == want:
-                return True
-        except Exception:
-            pass
-    return _fold(actions.edit.selected_text()).strip() == want
+    if pattern is None:
+        return None
+    try:
+        ranges = pattern.selection
+        if not ranges:
+            return None if pattern.supported_text_selection == "None" else ""
+        text = ranges[0].text
+        return text if _fold(text).strip() else ""
+    except Exception:
+        return None
+
+
+def _read_selection() -> str:
+    """Selected text: UI Automation when available, otherwise copy (community edit.selected_text)."""
+    text = _uia_selection_text()
+    return actions.edit.selected_text() if text is None else text
+
+
+def _selection_matches(expected: str) -> bool:
+    """True if the current selection is `expected`, compared tolerantly (see _FOLD)."""
+    return _fold(_read_selection()).strip() == _fold(expected).strip()
 
 
 def _uia_select_before_cursor(text: str, pattern=None, caret=None) -> bool:
@@ -232,8 +248,79 @@ def _recent_paste_here(window_id) -> bool:
     )
 
 
+def _text_before_cursor(max_chars: int) -> str:
+    """Up to `max_chars` of text before the cursor, via UI Automation ("" if unavailable)."""
+    pattern = _text_pattern()
+    if pattern is None:
+        return ""
+    try:
+        ranges = pattern.selection
+        if not ranges:
+            return ""
+        head = ranges[0].clone()
+        head.move_endpoint_by_range("End", "Start", target=ranges[0])
+        head.move_endpoint_by_unit("Start", "Character", -max_chars)
+        return head.text
+    except Exception as e:
+        print(f"GPT: couldn't read text before the cursor: {e!r}")
+        return ""
+
+
+# "jarvis ask ..." (local, 2026-11-20). Upstream's "Generate text that
+# satisfies the question" without context gave five generic subject lines with
+# [Topic] placeholders; Haiku also prefixed a list with a heading.
+_ASK_PROMPT = (
+    "Answer the question or fulfil the request below, using the context if given. "
+    "If it asks for one thing (a title, a subject line, a sentence), give the single best one "
+    "unless it explicitly asks for several; if several, put one per line, numbered. "
+    "Return only the answer itself: no heading, no introduction, no quotes."
+)
+
+
+def _edit_prompt(instruction: str, previous_response: bool = False) -> str:
+    """Prompt for "jarvis please <instruction>" (local, 2026-11-20).
+
+    The result replaces the selection, so ask for the text exactly as it
+    should now read. Two failures shaped the wording: "turn the second half
+    into a bulleted list" returned only the bullets (both paragraphs got
+    replaced); after "return the complete text" was added, "keep only the
+    second one" kept the list's heading and the "2." numbering.
+    """
+    target = "your previous response" if previous_response else "the text below"
+    return (
+        f"Edit {target} according to this instruction: {instruction}. "
+        "Return the text exactly as it should now read in the document, and nothing else "
+        "(no commentary, no quotes around it). Keep everything the instruction doesn't touch. "
+        "If the instruction picks or keeps only some of the text, return just that, "
+        "without list numbers, bullets or headings left over."
+    )
+
+
+def _drop_lead_in(answer: str) -> str:
+    """Drop a heading line like "Three subject lines for this email:" above a list.
+
+    Haiku added one to "ask for three subject lines" (2026-11-20) despite the
+    prompt; only removed when it ends with ":" and a list follows.
+    """
+    lines = answer.split("\n")
+    rest = [line for line in lines[1:] if line.strip()]
+    if (
+        len(lines) > 1
+        and lines[0].rstrip().endswith(":")
+        and rest
+        and all(line.lstrip()[:1].isdigit() or line.lstrip()[:1] in "-*•" for line in rest)
+    ):
+        return "\n".join(lines[1:]).strip()
+    return answer
+
+
 def _clean_result(result: str, original: str) -> str:
-    """Undo small model habits when replacing `original` in place."""
+    """Undo small model habits in a result (`original` is the text it replaces, or "")."""
+    result = result.strip()
+    # The triple quotes talon-ai-tools wraps around the text it sends, echoed
+    # back (Haiku, 2026-11-20).
+    if result.startswith('"""') and result.endswith('"""') and len(result) >= 6:
+        result = result[3:-3].strip()
     # Wrapping quotes the original didn't have (Haiku did this once).
     for open_q, close_q in (('"', '"'), ("“", "”"), ("'", "'")):
         if (
@@ -358,31 +445,40 @@ class UserActions:
         if not text_to_process.get("text") and not text_to_process.get("image_url"):
             text_to_process = None  # type: ignore
 
-        # A selection-based prompt with nothing selected would send the bare
-        # prompt and paste whatever comes back at the cursor. If a result was
-        # just pasted here, apply the prompt to it instead ("jarvis make it
-        # friendlier" right after "jarvis make it professional" works without
-        # "and" - on 2026-11-20 the "and" was missed twice). Otherwise refuse.
-        # Free-form "please"/"ask" prompts and "jarvis and ..." follow-ups
-        # legitimately run without a selection.
+        # Local split (2026-11-20): "please ..." always EDITS text, "ask ..."
+        # always WRITES/ANSWERS. Upstream's "please" with nothing selected
+        # sent the bare instruction, and Claude's reply ("I can't see the
+        # document...") got pasted into Word.
+        asking = prompt.startswith("ask")
+
+        # Nothing selected. If a result was just pasted here, apply the prompt
+        # to it ("jarvis make it friendlier" or "jarvis please keep only the
+        # second one" right after a result works without "and" - on
+        # 2026-11-20 the "and" was missed twice). Otherwise refuse: a prompt
+        # with nothing to work on would paste a reply to a bare prompt.
+        # "jarvis and ..." follow-ups are handled below.
         if (
             text_to_process is None
             and source in ("", "this")
             and not continuing
-            and not prompt.startswith(("ask", "please"))
+            and not asking
         ):
-            if _recent_paste_here(start_window_id) and _select_before_cursor(
-                GPTState.last_response
-            ):
-                text_to_process = format_message(GPTState.last_response)
-            else:
+            if not _recent_paste_here(start_window_id):
                 notify("Nothing selected - select some text first (nothing was sent)")
                 return
+            if not _select_before_cursor(GPTState.last_response):
+                notify("Couldn't select the previous result - select the text, then try again")
+                return
+            text_to_process = format_message(GPTState.last_response)
 
         # Text that must still be selected when the result arrives, so the
-        # result replaces exactly what was sent.
+        # result replaces exactly what was sent. ("ask" never replaces.)
         replace_text = ""
-        if text_to_process is not None and source in ("", "this", "lastTalonDictation"):
+        if (
+            not asking
+            and text_to_process is not None
+            and source in ("", "this", "lastTalonDictation")
+        ):
             replace_text = text_to_process.get("text", "")
 
         # Follow-up with nothing selected ("jarvis and make it shorter"):
@@ -402,10 +498,28 @@ class UserActions:
             replace_text = GPTState.last_response
 
         # Handle special cases in the prompt
-        ### Ask is a special case, where the text to process is the prompted question, not selected text
-        if prompt.startswith("ask"):
-            text_to_process = format_message(prompt.removeprefix("ask"))
-            prompt = "Generate text that satisfies the question or request given in the input."
+        if asking:
+            # Local change (2026-11-20): upstream sent only the question, so
+            # "what is a good subject line for this email" got five generic
+            # options with [Topic] placeholders. Now the selection - or, with
+            # none, the text above the cursor - goes along as context, and
+            # one best answer is asked for unless several are requested. With
+            # a selection, the answer goes on a new line below it.
+            question = prompt.removeprefix("ask").strip()
+            context = (text_to_process or {}).get("text", "") or _text_before_cursor(4000)
+            if text_to_process is not None and destination == "":
+                destination = "below"
+            text_to_process = format_message(
+                f"Question or request: {question}\n\n"
+                + (f"Context - the text the user is working on:\n{context}" if context.strip() else "")
+            )
+            prompt = _ASK_PROMPT
+        elif prompt.startswith("please"):
+            # Local change (2026-11-20): see _edit_prompt.
+            prompt = _edit_prompt(
+                prompt.removeprefix("please").strip(),
+                previous_response=text_to_process is None,
+            )
 
         _job["id"] += 1
         job_id = _job["id"]
@@ -429,9 +543,9 @@ class UserActions:
             if error is not None:
                 print(f"GPT: request failed: {error!r}")  # the backend already notified
                 return
-            text = extract_message(response)  # type: ignore
-            if replace_text:
-                text = _clean_result(text, replace_text)
+            text = _clean_result(extract_message(response), replace_text)  # type: ignore
+            if asking:
+                text = _drop_lead_in(text)
             GPTState.last_response = text
             insert_to = destination
             if insert_to in _PASTE_DESTINATIONS:
@@ -655,4 +769,6 @@ class UserActions:
                         "GPT Failure: User applied a prompt to the phrase last Talon Dictation, but there was no text to reformat"
                     )
             case "this" | _:
-                return format_message(actions.edit.selected_text())
+                # Local change (2026-11-20): UI Automation first, no Ctrl+C
+                # where avoidable (see _uia_selection_text).
+                return format_message(_read_selection())
