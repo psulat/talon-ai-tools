@@ -44,6 +44,72 @@ def _active_window_id():
 # Talon's 2 s watchdog). Only one request at a time; "jarvis cancel" bumps the
 # id so a late result is ignored.
 _job: dict[str, Any] = {"id": 0, "running": False, "started": 0.0}
+# Subject-line flow (local, 2026-11-20, Pete's request): true while the last
+# pasted result is a list of subject-line options, so picking one ("jarvis
+# please keep only the second one") sends it to the email's Subject box.
+# Kept on GPTState (lib/modelState.py), not in this module, so they survive
+# Talon reloading gpt.py: every code edit reloaded it and wiped "what was
+# just pasted where", and the next "jarvis please keep only the second one"
+# found nothing to work on (2026-11-20).
+if not hasattr(GPTState, "subject_flow"):
+    GPTState.subject_flow = {"options_pasted": False}  # type: ignore[attr-defined]
+if not hasattr(GPTState, "paste_info"):
+    GPTState.paste_info = {"window": None, "time": 0.0}  # type: ignore[attr-defined]
+_subject_flow: dict[str, bool] = GPTState.subject_flow  # type: ignore[attr-defined]
+_paste_info: dict = GPTState.paste_info  # type: ignore[attr-defined]
+
+
+_PASTE_RESTORE_DELAY = "600ms"
+
+
+def _paste(text: str) -> None:
+    """Paste `text`, put the old clipboard back, and check the text landed (local, 2026-11-20).
+
+    Like community user.paste, but waits 600 ms instead of 150 ms before
+    restoring the clipboard, so a slow app can't paste the old contents
+    instead. On 2026-11-20 a stale clipboard entry (an earlier jarvis result)
+    turned up in a Gmail draft, and no paste command had been spoken. Then
+    reads the text before the cursor via UI Automation and warns if it
+    doesn't end with what was pasted.
+    """
+    with clip.revert():
+        clip.set_text(text)
+        actions.edit.paste()
+        actions.sleep(_PASTE_RESTORE_DELAY)
+    cron.after("200ms", lambda: _check_pasted(text))
+
+
+def _squash(text: str) -> str:
+    """Folded text with all whitespace runs collapsed (apps reformat line breaks on paste)."""
+    return " ".join(_fold(text).split())
+
+
+def _check_pasted(text: str) -> None:
+    before = _text_before_cursor(len(text) + 60)
+    if not before:
+        return  # no UI Automation text in this app: nothing to check against
+    expected = _squash(text)[-80:]
+    if expected and not _squash(before).endswith(expected):
+        print(f"GPT: paste check failed; expected end {expected!r}, found {_squash(before)[-80:]!r}")
+        notify("The paste didn't come out as expected - check the text (Ctrl+Z undoes it)")
+
+
+def _put_in_email_subject(text: str, remove_selection: bool) -> str:
+    """Put a subject line into the active email compose window.
+
+    Uses user.email_put_subject from Pete's personal repo (ai_actions.py),
+    which writes Chrome's Subject box via UI Automation and, with
+    remove_selection, first deletes the selected text from the body.
+    Returns "set", "failed" (a Subject box exists but didn't take it - never
+    paste then: writing it can move the cursor into the Subject, which is how
+    the line got pasted there twice on 2026-11-20), or "no_box" (no compose
+    window, or the action doesn't exist on this machine) so callers paste.
+    """
+    try:
+        return str(actions.user.email_put_subject(text, remove_selection))
+    except Exception as e:
+        print(f"GPT: no email subject action: {e!r}")
+        return "no_box"
 _JOB_STALE_S = 60
 
 
@@ -172,6 +238,9 @@ def _uia_select_before_cursor(text: str, pattern=None, caret=None) -> bool:
             return False
         first = index_map[len(trimmed) - len(target)]
         last = index_map[len(trimmed) - 1] + 1
+        # Offsets, not TextRange.find_text: in Gmail, Chrome's find_text with
+        # a multi-line string returned a range starting at line 2 (verified
+        # 2026-11-20), while these offsets select the list exactly.
         selection = end.clone()
         selection.move_endpoint_by_unit("Start", "Character", -(len(head_text) - first))
         selection.move_endpoint_by_unit("End", "Character", -(len(head_text) - last))
@@ -201,10 +270,32 @@ def _keys_select_before_cursor(text: str) -> bool:
             if pause != "0ms":
                 actions.sleep(pause)
             remaining -= step
-        if _selection_matches(text):
+        if _wait_for_selection(text):
             return True
         actions.key("right")  # collapse to the selection's end, where the cursor was
     return False
+
+
+def _wait_for_selection(text: str, timeout_s: float = 0.8) -> bool:
+    """True once the selection is `text`, re-checking for up to `timeout_s`.
+
+    Chrome applies a new selection a moment later: in Gmail, an immediate
+    read-back still reported the old (empty) selection, so a correct
+    selection was judged wrong and "couldn't select the previous result"
+    (2026-11-20). Notepad and Word apply it at once. Where there's no UI
+    Automation text (the check would copy with Ctrl+C), check once after a
+    short pause instead of polling.
+    """
+    if _uia_selection_text() is None:
+        actions.sleep("150ms")
+        return _selection_matches(text)
+    deadline = time.monotonic() + timeout_s
+    while True:
+        if _selection_matches(text):
+            return True
+        if time.monotonic() >= deadline:
+            return False
+        actions.sleep("80ms")
 
 
 def _select_before_cursor(text: str) -> bool:
@@ -212,7 +303,7 @@ def _select_before_cursor(text: str) -> bool:
     if not _normalize(text).strip():
         return False
     if _uia_select_before_cursor(text):
-        if _selection_matches(text):
+        if _wait_for_selection(text):
             return True
         actions.key("right")
     if _keys_select_before_cursor(text):
@@ -232,9 +323,16 @@ def _log_select_failure(text: str) -> None:
             before = head.text[-80:]
         except Exception as e:
             before = f"(error reading: {e!r})"
+    try:
+        element = ui.focused_element()
+        focused = f"{element.control_type} {element.name[:30]!r}"
+    except Exception:
+        focused = "?"
+    selected = _uia_selection_text()
     print(
         f"GPT: couldn't select {len(text)} chars ending {text[-60:]!r}; "
-        f"text before the cursor: {before!r}"
+        f"text before the cursor: {before!r}; focused: {focused}; "
+        f"selection now: {(selected or '')[:80]!r}"
     )
 
 
@@ -243,8 +341,8 @@ def _recent_paste_here(window_id) -> bool:
     return (
         GPTState.last_was_pasted
         and bool(GPTState.last_response)
-        and _job.get("paste_window") == window_id
-        and time.monotonic() - _job.get("paste_time", 0.0) < 600
+        and _paste_info["window"] == window_id
+        and time.monotonic() - _paste_info["time"] < 600
     )
 
 
@@ -497,6 +595,15 @@ class UserActions:
                 return
             replace_text = GPTState.last_response
 
+        # Subject-line request: asking for subject line(s), or editing a list
+        # of subject options just pasted. A single-line result then goes to
+        # the email's Subject box instead of the body (see finish()).
+        about_subject = (asking and "subject" in prompt.lower()) or (
+            _subject_flow["options_pasted"]
+            and bool(replace_text)
+            and replace_text == GPTState.last_response
+        )
+
         # Handle special cases in the prompt
         if asking:
             # Local change (2026-11-20): upstream sent only the question, so
@@ -555,9 +662,36 @@ class UserActions:
                 elif replace_text and not _selection_matches(replace_text):
                     notify("Selection changed while waiting - result copied to clipboard instead")
                     insert_to = "clipboard"
-            actions.user.gpt_insert_response(format_message(text), insert_to)
+            single_line = len([line for line in text.splitlines() if line.strip()]) == 1
+            if about_subject and single_line and insert_to in _PASTE_DESTINATIONS:
+                # The option list it was picked from (still selected, checked
+                # above) is removed from the body first, then the line goes
+                # into the Subject box.
+                status = _put_in_email_subject(text, remove_selection=bool(replace_text))
+                if status != "no_box":
+                    GPTState.last_was_pasted = False
+                    _subject_flow["options_pasted"] = False
+                    if status != "set":
+                        restore = "; Ctrl+Z in the body brings the list back" if replace_text else ""
+                        notify(f"Couldn't set the subject - it's on the clipboard{restore}")
+                    return
+            # Options to choose from stay in the body; remember that they are
+            # subject lines so the pick goes to the Subject box.
+            _subject_flow["options_pasted"] = (
+                about_subject and not single_line and insert_to in _PASTE_DESTINATIONS
+            )
+            to_paste = text
+            if asking and insert_to in ("", "paste"):
+                # An answer typed at the end of a sentence ran into it ("...the
+                # twelfth1. Migration update", Gmail, 2026-11-20): start it on
+                # its own line. last_response stays without the break, so
+                # follow-ups still find and select exactly the answer.
+                before = _text_before_cursor(1)
+                if before and not before.isspace():
+                    to_paste = "\n" + text
+            actions.user.gpt_insert_response(format_message(to_paste), insert_to)
             if insert_to in _PASTE_DESTINATIONS:
-                _job.update(paste_window=start_window_id, paste_time=time.monotonic())
+                _paste_info.update(window=start_window_id, time=time.monotonic())
             if source == "lastTalonDictation" and insert_to != "clipboard":
                 # So "jarvis fix last" again targets the corrected text.
                 actions.user.add_phrase_to_history(text)
@@ -669,12 +803,12 @@ class UserActions:
                 actions.key("left")
                 actions.edit.line_insert_up()
                 GPTState.last_was_pasted = True
-                actions.user.paste(message_text_no_images)
+                _paste(message_text_no_images)
             case "below":
                 actions.key("right")
                 actions.edit.line_insert_down()
                 GPTState.last_was_pasted = True
-                actions.user.paste(message_text_no_images)
+                _paste(message_text_no_images)
             case "clipboard":
                 clip.set_text(message_text_no_images)
             case "snip":
@@ -715,18 +849,18 @@ class UserActions:
                 actions.user.confirmation_gui_append(message_text_no_images)
             case "chain":
                 GPTState.last_was_pasted = True
-                actions.user.paste(message_text_no_images)
+                _paste(message_text_no_images)
                 actions.user.gpt_select_last()
 
             case "paste":
                 GPTState.last_was_pasted = True
-                actions.user.paste(message_text_no_images)
+                _paste(message_text_no_images)
             # If the user doesn't specify a method assume they want to paste.
             # However if they didn't specify a method when the confirmation gui
             # is showing, assume they don't want anything to be inserted
             case _ if not confirmation_gui.showing:
                 GPTState.last_was_pasted = True
-                actions.user.paste(message_text_no_images)
+                _paste(message_text_no_images)
             # Don't do anything if none of the previous conditions were valid
             case _:
                 pass
