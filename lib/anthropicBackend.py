@@ -3,7 +3,7 @@ Claude backend for talon-ai-tools: a minimal Anthropic Messages API client.
 
 Local addition on the `claude-backend` branch (2026-11-20), not upstream.
 Selected with `user.model_endpoint = "anthropic"`; see
-personal/ai_plan.md (T1.1) for the wider plan.
+personal/docs/ai_plan.md (T1.1) for the wider plan.
 
 Why raw HTTP instead of the official `anthropic` SDK: the SDK installs fine
 into Talon's venv, but cannot be imported inside Talon 1.0. Talon hides

@@ -38,7 +38,7 @@ def _active_window_id():
         return None
 
 
-# --- Local claude-backend additions (2026-11-20, personal/ai_plan.md) ---
+# --- Local claude-backend additions (2026-11-20, personal/docs/ai_plan.md) ---
 # gpt_apply_prompt runs its request in a background thread so Talon keeps
 # listening (it used to block speech for the whole request, ~1-2 s, tripping
 # Talon's 2 s watchdog). Only one request at a time; "jarvis cancel" bumps the
@@ -525,7 +525,7 @@ class UserActions:
     ):
         """Apply an arbitrary prompt to arbitrary text"""
 
-        # Local claude-backend changes (2026-11-20, personal/ai_plan.md
+        # Local claude-backend changes (2026-11-20, personal/docs/ai_plan.md
         # T1.5/T1.6): the request runs in a background thread (see _job
         # above), with guards before sending and again before pasting.
         if _job["running"] and time.monotonic() - _job["started"] < _JOB_STALE_S:

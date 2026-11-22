@@ -42,7 +42,7 @@ MODELS_PATH = Path(__file__).parent.parent / "models.json"
 # Store loaded model configurations
 model_configs: dict[str, ModelConfig] = {}
 
-# --- Local claude-backend additions (2026-11-20, personal/ai_plan.md) ---
+# --- Local claude-backend additions (2026-11-20, personal/docs/ai_plan.md) ---
 
 # T1.6: conversation state for "model and ..." follow-ups on the Claude path.
 # Append-only on purpose. Opus/Sonnet 5.5 bind each thinking block to the
@@ -310,7 +310,7 @@ def log_request(
     elapsed_ms: float,
     error: Optional[Exception],
 ) -> None:
-    """Append one request to the local JSONL log (local addition, ai_plan.md T1.7).
+    """Append one request to the local JSONL log (local addition, personal/docs/ai_plan.md T1.7).
 
     Logging must never break a model command, so every failure here is swallowed.
     """
